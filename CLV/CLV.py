@@ -1,7 +1,7 @@
 import os
 import contextlib
 import argparse
-from core import sfconnector
+from core import sfconnector, s3connector
 import pandas as pd
 import numpy as np
 from ggplot import *
@@ -12,47 +12,65 @@ from lifetimes import ParetoNBDFitter
 from lifetimes import plotting
 
 # Available models to use:
-# BetaGeoFitter - new method
-# ModifiedBetaGeoFitter - new method
+# BetaGeoFitter - 2011 new method
+# ModifiedBetaGeoFitter - 2002 new method
 # ParetoNBDFitter - old method from 1980's paper
 
 # TODO: finish the arg parse.  Add a parameter for save chart / images files for eval of each run.
-"""
-# Get argv values
-argparser = argparse.ArgumentParser(description="Provide arguments for prediction model.")
-argparser.add_argument('-t', '--time_block',
-                       help='Assign the standard time grouping block',
-                       required=False,
-                       default='week',
-                       choices=['day', 'week', 'month', 'quarter', 'year'])
-argparser.add_argument('-pt', '--prediction_time',
-                       help='Number of prediction blocks based on time_block argument',
-                       required=True,
-                       type=int)
-argparser.add_argument('-dc', '--date_cohort',
-                       help="Set the start date of cohorts in format: 'YYYY-mm-dd'",
-                       required=True)
-argparser.add_argument('-ct', '--cohort_field',
-                       help="Use either LAST_ORDER_DT or FIRST_ORDER_DT for cohort selection",
-                       required=False,
-                       default='FIRST_ORDER_DT')
-argparser.add_argument('-ua', '--user_acct',
-                       help="Enter directory from home to location of username and password for Snowflake",
-                       required=True)
-argparser.add_argument('-v', '--verbosity_mode',
-                       help="Enter to enable debug reporting on performance of model and data results",
-                       action='store_true')
-argparser.add_argument('-vl', '--verbosity_log_dir',
-                       help="Directory to store plots, graphs, and log.",
-                       required=False)
-argparser.add_argument('-mt', '--model_type',
-                       help="Enter the model type to use. BGD, MBGD, or PNDB",
-                       choices=['BGF', 'MBGF', 'PNDB'],
-                       required=True)
 
-args = argparser.parse_args()
-# finish the rest of this logic for command line configuration of this app.
-"""
+
+def retrieve_args():
+    # Get argv values
+    argparser = argparse.ArgumentParser(description="Provide arguments for prediction model.")
+    argparser.add_argument('-t', '--time_block',
+                           help='Assign the standard time grouping block',
+                           required=False,
+                           default='week',
+                           type=str,
+                           choices=['day', 'week', 'month', 'quarter', 'year'])
+    argparser.add_argument('-pt', '--prediction_time',
+                           help='Number of prediction blocks based on time_block argument',
+                           required=True,
+                           type=int)
+    argparser.add_argument('-dc', '--date_cohort',
+                           help="Set the start date of cohorts in format: 'YYYY-mm-dd'",
+                           type=str,
+                           required=True)
+    argparser.add_argument('-ct', '--cohort_field',
+                           help="Use either LAST_ORDER_DT or FIRST_ORDER_DT for cohort selection",
+                           required=False,
+                           type=str,
+                           default='FIRST_ORDER_DT')
+    argparser.add_argument('-sfc', '--snowflake_config_loc',
+                           help="Enter directory from home to location of username and password for Snowflake",
+                           type=str,
+                           required=True)
+    argparser.add_argument('-v', '--verbosity_mode',
+                           help="Enter to enable debug reporting on performance of model and data results",
+                           action='store_true')
+    argparser.add_argument('-ld', '--log_dir',
+                           help="Directory to store plots, graphs, and log.",
+                           type=str,
+                           required=False)
+    argparser.add_argument('-mt', '--model_type',
+                           help="Enter the model type to use. BGD, MBGD, or PNDB",
+                           choices=['BGF', 'MBGF', 'PNDB'],
+                           type=str,
+                           required=True)
+    # parse the arguments
+    args = argparser.parse_args()
+    # assign the variables to argument values.
+    time_block = args.time_block
+    prediction_time = args.prediction_time
+    date_cohort = args.date_cohort
+    cohort_field = args.cohort_field
+    snowflake_config_loc = args.snowflake_config_loc
+    verbosity_mode = args.verbosity_mode
+    log_dir = args.log_dir
+    model_type = args.model_type
+
+    return time_block, prediction_time, date_cohort, cohort_field, snowflake_config_loc, \
+        verbosity_mode, log_dir, model_type
 
 
 def query_mod(query_string, term_period='week'):
@@ -83,6 +101,7 @@ def model_fit(df, modeler, penalizer=0.0):
     """
     Fit the frequency, recency, and T values to a BetaGeoFitter model.
     :param df: source dataframe where the fields reside.
+    :param modeler: set the modeler type to use.
     :param penalizer: coefficient for applying a penalizer to the model.
     :return: the model
     """
@@ -115,8 +134,7 @@ def prediction(df, model_instance, future_term, field_result_name):
     return df
 
 
-# GammaGammaFitter for returning customers.... (CLV)
-def clv_calc(df, time_block, model_result, discount_rate=0.0, penalizer_coef=0, logfile=None):
+def clv_calc(df, time_block, model_result, logfile, discount_rate=0.0, penalizer_coef=0):
     """
     Calculate expected purchases for repeat customers, as well as CLV for repeat customers
     :param df: input data frame
@@ -146,15 +164,11 @@ def clv_calc(df, time_block, model_result, discount_rate=0.0, penalizer_coef=0, 
         pop_avg_profit = (p * v) / (q - 1)
         avg_cond_profit = returning_customers['expected_profit'].mean()
         avg_real_profit = returning_customers['monetary_value'].mean()
-        # TODO: change this to print to a log.
         with open(logfile, "a") as f:
             f.write('GGF model output: \n' + str(ggf) + '\n')
             f.write("Expected conditional average profit: %s, Population Average Profit: %s, Average Real Profit: %s" %
                     (avg_cond_profit, pop_avg_profit, avg_real_profit))
     return returning_customers
-
-# TODO: fill in the rest of the descriptions on the functions, get the verbosity charting and reporting setup
-# with the rest of the functions.  ggplot.save() functions as well.
 
 
 def data_joiner(original_df, return_df):
@@ -245,50 +259,46 @@ query = """SELECT
     """
 
 
-
-### TODO: put all of this in the main method below.
-
-# retrieve the username / pwd for snowflake ####################
-username, password = sfconnector.account_details(os.path.join(os.path.expanduser('~'), 'Documents/snowflakeauth.txt'))
-# Get the data, using default term of 'week'
-raw_data = sfconnector.SnowConnect(query_mod(query), username, password).execute_query()
-# Change the monetary value field to a float
-raw_data['monetary_value'] = raw_data['monetary_value'].astype(float)
-# Get the subset based on cohort age.  Default value for date_value is beginning of time. #################
-buyer_data = data_date_trim(raw_data, 'FIRST_ORDER_DT', '%Y-%m-%d', '2016-06-01')
-
-
 #############
 model_type = 'BGF'
 ###############
 # this will be replaced by sysargs: #############################
 prediction_time = 4
 verbosity = True
+doc_loc = os.path.join(os.path.expanduser('~'), 'Documents/CLV/Auto')
 #################################################################
 
+# TODO: test s3 dataframe write. s3connector.aws_key_retrieve_local , s3connector.s3_dataframe_upload
 
-
-# run the model and create predictions
-model_result = model_fit(buyer_data, model_type)
-prediction(buyer_data, model_result, prediction_time, 'predicted_purchases')
-returning_df = clv_calc(buyer_data, prediction_time, model_result, discount_rate=0.1)
-merged_data = data_joiner(buyer_data, returning_df)
-
-
-
-
-
-doc_loc = os.path.join(os.path.expanduser('~'), 'Documents/CLV/Auto')
-if verbosity:
-    if not os.path.exists(doc_loc):
-        os.makedirs(doc_loc)
-    # trash the log file if it exists.
-    with contextlib.suppress(FileNotFoundError):
-        os.remove(os.path.join(doc_loc, 'Notes.txt'))
-    model_attributes(doc_loc, buyer_data, model_result, prediction_time, returning_df)
-
-"""
 if __name__ == '__main__':
+    # get all of the arguments
+    time_block, prediction_time, date_cohort, cohort_field, sf_config_loc, verbosity, doc_loc, \
+        model_type = retrieve_args()
 
+    # prep for logging and charting
+    if verbosity:
+            if not os.path.exists(doc_loc):
+                os.makedirs(doc_loc)
+            # trash the log file if it exists.
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(os.path.join(doc_loc, 'Notes.txt'))
 
-"""
+    # retrieve the username / pwd for snowflake
+    username, password = sfconnector.account_details(
+        os.path.join(os.path.expanduser('~'), 'Documents/snowflakeauth.txt'))
+
+    # Get the data, using default term of 'week'
+    raw_data = sfconnector.SnowConnect(query_mod(query), username, password).execute_query()
+    # Change the monetary value field to a float
+    raw_data['monetary_value'] = raw_data['monetary_value'].astype(float)
+
+    # Get the subset based on cohort age.  Default value for date_value is beginning of time. #################
+    buyer_data = data_date_trim(raw_data, 'FIRST_ORDER_DT', '%Y-%m-%d', '2016-06-01')
+
+    # run the model and create predictions
+    model_result = model_fit(buyer_data, model_type)
+    prediction(buyer_data, model_result, prediction_time, 'predicted_purchases')
+    returning_df = clv_calc(buyer_data, prediction_time, model_result, 'Notes.txt', discount_rate=0.1)
+    merged_data = data_joiner(buyer_data, returning_df)
+    if verbosity:
+        model_attributes(doc_loc, buyer_data, model_result, prediction_time, returning_df)

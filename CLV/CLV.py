@@ -1,9 +1,10 @@
+import sys
+sys.path.append("/Users/bewilson/PycharmProjects/")
 import os
 import contextlib
 import argparse
 from core import sfconnector, s3connector
 import pandas as pd
-import numpy as np
 from ggplot import *
 from lifetimes import GammaGammaFitter
 from lifetimes import BetaGeoFitter
@@ -15,8 +16,12 @@ from lifetimes import plotting
 # BetaGeoFitter - 2011 new method
 # ModifiedBetaGeoFitter - 2002 new method
 # ParetoNBDFitter - old method from 1980's paper
-
-# TODO: finish the arg parse.  Add a parameter for save chart / images files for eval of each run.
+"""
+Example use:
+>>> python ./Marketing/CLV/CLV.py -t='week' -pt=8 -dc='2016-02-01' -ct='FIRST_ORDER_DT'
+-sfc='Documents/snowflakeauth.txt' -v=True -ld='Documents/CLV/Auto' -mt='BGF' -ot 'Local'
+-op='Documents/CLV/Auto/Outputfile.csv'
+"""
 
 
 def retrieve_args():
@@ -33,7 +38,7 @@ def retrieve_args():
                            required=True,
                            type=int)
     argparser.add_argument('-dc', '--date_cohort',
-                           help="Set the start date of cohorts in format: 'YYYY-mm-dd'",
+                           help="Set the start date of cohorts in string format: 'YYYY-mm-dd'",
                            type=str,
                            required=True)
     argparser.add_argument('-ct', '--cohort_field',
@@ -42,12 +47,14 @@ def retrieve_args():
                            type=str,
                            default='FIRST_ORDER_DT')
     argparser.add_argument('-sfc', '--snowflake_config_loc',
-                           help="Enter directory from home to location of username and password for Snowflake",
+                           help="Enter location of txt file for username and password to Snowflake",
                            type=str,
                            required=True)
     argparser.add_argument('-v', '--verbosity_mode',
                            help="Enter to enable debug reporting on performance of model and data results",
-                           action='store_true')
+                           required=False,
+                           type=bool,
+                           default=False)
     argparser.add_argument('-ld', '--log_dir',
                            help="Directory to store plots, graphs, and log.",
                            type=str,
@@ -57,20 +64,32 @@ def retrieve_args():
                            choices=['BGF', 'MBGF', 'PNDB'],
                            type=str,
                            required=True)
+    argparser.add_argument('-ot', '--output_type',
+                           help="Output type: S3 or Local",
+                           type=str,
+                           required=True,
+                           choices=['Local', 'S3'])
+    argparser.add_argument('-op', '--output_path',
+                           help="Output path to save the generated file.  Local: path + filename.  S3: filename only.",
+                           type=str,
+                           required=True)
     # parse the arguments
     args = argparser.parse_args()
+
     # assign the variables to argument values.
-    time_block = args.time_block
-    prediction_time = args.prediction_time
-    date_cohort = args.date_cohort
-    cohort_field = args.cohort_field
+    time_block_a = args.time_block
+    prediction_time_a = args.prediction_time
+    date_cohort_a = args.date_cohort
+    cohort_field_a = args.cohort_field
     snowflake_config_loc = args.snowflake_config_loc
     verbosity_mode = args.verbosity_mode
-    log_dir = args.log_dir
-    model_type = args.model_type
+    log_dir_a = args.log_dir
+    model_type_a = args.model_type
+    output_type_a = args.output_type
+    output_loc_a = args.output_path
 
-    return time_block, prediction_time, date_cohort, cohort_field, snowflake_config_loc, \
-        verbosity_mode, log_dir, model_type
+    return time_block_a, prediction_time_a, date_cohort_a, cohort_field_a, snowflake_config_loc, \
+        verbosity_mode, log_dir_a, model_type_a, output_type_a, output_loc_a
 
 
 def query_mod(query_string, term_period='week'):
@@ -83,17 +102,17 @@ def query_mod(query_string, term_period='week'):
     return query_string.format(term=term_period)
 
 
-def data_date_trim(dataframe, trim_field, date_format, date_value='1990-01-01'):
+def data_date_trim(dataframe, trim_field, date_fmt, date_value='1990-01-01'):
     """
     Subset of the main pull to restrict the epoch of the analysis to groups of buyers (cohorts) based on order dates
         and give only the fields that are needed for the core analysis of CLV.
     :param dataframe: the source dataframe
     :param trim_field: the field used (e.g. FIRST_ORDER_DT)
-    :param date_format: snowflake date format string (e.g. '%Y-%m-%d')
+    :param date_fmt: snowflake date format string (e.g. '%Y-%m-%d')
     :param date_value: date in form YYYY-mm-dd for start of cohort activity
     :return: subset of source dataframe based on filtering conditions and necessary fields.
     """
-    trimmed = dataframe[pd.to_datetime(dataframe[trim_field], format=date_format) > date_value]
+    trimmed = dataframe[pd.to_datetime(dataframe[trim_field], format=date_fmt) > date_value]
     return trimmed[['frequency', 'recency', 'T', 'monetary_value', 'Last_order_age', 'MEMBER_SK']]
 
 
@@ -134,14 +153,14 @@ def prediction(df, model_instance, future_term, field_result_name):
     return df
 
 
-def clv_calc(df, time_block, model_result, logfile, discount_rate=0.0, penalizer_coef=0):
+def clv_calc(df, t_block, model_used, logfile, discount_rate=0.0, penalizer_coef=0):
     """
     Calculate expected purchases for repeat customers, as well as CLV for repeat customers
     :param df: input data frame
-    :param time_block: the prediction time frame (time_block * time_block type)
+    :param t_block: the prediction time frame (time_block * time_block type)
         e.g. if futures for a month are desired and the analysis time block is by 'week', then
         the time_block should be 4.
-    :param model_result: the model that was fit on the main data.
+    :param model_used: the model that was fit on the main data.
     :param discount_rate: used for depreciation / model tuning
     :param penalizer_coef: model tuning
     :param  logfile: if verbosity is turned on, supply a file location to write to.
@@ -152,12 +171,12 @@ def clv_calc(df, time_block, model_result, logfile, discount_rate=0.0, penalizer
     ggf.fit(returning_customers['frequency'], returning_customers['monetary_value'])
     returning_customers['expected_profit'] = ggf.conditional_expected_average_profit(
         returning_customers['frequency'], returning_customers['monetary_value'])
-    returning_customers['CLV'] = ggf.customer_lifetime_value(model_result,
+    returning_customers['CLV'] = ggf.customer_lifetime_value(model_used,
                                                              returning_customers['frequency'],
                                                              returning_customers['recency'],
                                                              returning_customers['T'],
                                                              returning_customers['monetary_value'],
-                                                             time=time_block,
+                                                             time=t_block,
                                                              discount_rate=discount_rate)
     if verbosity:
         p, q, v = ggf._unload_params('p', 'q', 'v')
@@ -259,46 +278,49 @@ query = """SELECT
     """
 
 
-#############
-model_type = 'BGF'
-###############
-# this will be replaced by sysargs: #############################
-prediction_time = 4
-verbosity = True
-doc_loc = os.path.join(os.path.expanduser('~'), 'Documents/CLV/Auto')
-#################################################################
-
-# TODO: test s3 dataframe write. s3connector.aws_key_retrieve_local , s3connector.s3_dataframe_upload
+def output_save(output_format, path, df):
+    if output_format == "Local":
+        output_location = os.path.join(os.path.expanduser('~'), path)
+        df.to_csv(output_location, sep='|', encoding='utf-8')
+    else:
+        # TODO: test s3 dataframe write-> s3connector.aws_key_retrieve_local , s3connector.s3_dataframe_upload
+        pass
 
 if __name__ == '__main__':
     # get all of the arguments
     time_block, prediction_time, date_cohort, cohort_field, sf_config_loc, verbosity, doc_loc, \
-        model_type = retrieve_args()
+        model_type, output_type, output_loc = retrieve_args()
 
     # prep for logging and charting
     if verbosity:
-            if not os.path.exists(doc_loc):
-                os.makedirs(doc_loc)
+        if output_type == 'Local':
+            logging_loc = os.path.join(os.path.expanduser('~'), doc_loc)
+            if not os.path.exists(logging_loc):
+                os.makedirs(logging_loc)
             # trash the log file if it exists.
             with contextlib.suppress(FileNotFoundError):
-                os.remove(os.path.join(doc_loc, 'Notes.txt'))
+                os.remove(os.path.join(logging_loc, 'Notes.txt'))
+        #TODO: set a directory path to save images to S3
 
     # retrieve the username / pwd for snowflake
     username, password = sfconnector.account_details(
-        os.path.join(os.path.expanduser('~'), 'Documents/snowflakeauth.txt'))
+        os.path.join(os.path.expanduser('~'), sf_config_loc))
 
     # Get the data, using default term of 'week'
-    raw_data = sfconnector.SnowConnect(query_mod(query), username, password).execute_query()
+    raw_data = sfconnector.SnowConnect(query_mod(query, time_block), username, password).execute_query()
     # Change the monetary value field to a float
     raw_data['monetary_value'] = raw_data['monetary_value'].astype(float)
 
     # Get the subset based on cohort age.  Default value for date_value is beginning of time. #################
-    buyer_data = data_date_trim(raw_data, 'FIRST_ORDER_DT', '%Y-%m-%d', '2016-06-01')
+    buyer_data = data_date_trim(raw_data, cohort_field, '%Y-%m-%d', date_cohort)
 
     # run the model and create predictions
     model_result = model_fit(buyer_data, model_type)
     prediction(buyer_data, model_result, prediction_time, 'predicted_purchases')
     returning_df = clv_calc(buyer_data, prediction_time, model_result, 'Notes.txt', discount_rate=0.1)
     merged_data = data_joiner(buyer_data, returning_df)
-    if verbosity:
-        model_attributes(doc_loc, buyer_data, model_result, prediction_time, returning_df)
+    if verbosity & output_type == 'Local':
+        print("Saving charts to %s directory." % doc_loc)
+        model_attributes(logging_loc, buyer_data, model_result, prediction_time, returning_df)
+    output_save(output_type, output_loc, merged_data)
+
